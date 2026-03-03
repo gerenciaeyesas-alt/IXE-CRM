@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { supabase } from "./supabaseClient";
 
 const T = {
   bg: "#0D1117", sidebar: "#161B22", card: "#1C2128", border: "#30363D",
@@ -27,14 +28,20 @@ const uid   = () => Date.now().toString(36) + Math.random().toString(36).slice(2
 const fmt   = (d) => d ? new Date(d).toLocaleDateString("es-CO",{day:"2-digit",month:"short",year:"numeric"}) : "—";
 const today = () => new Date().toISOString().split("T")[0];
 
-// Storage — localStorage para versión web
-function load(key) {
-  try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : null; } catch { return null; }
-}
-function save(key, val) {
-  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
-}
+// ── Mappers: DB snake_case ↔ App camelCase ──────────────────────────────────
+const toContact = r => r ? ({ id:r.id, name:r.name, company:r.company, role:r.role||"", segment:r.segment||"Oil & Gas", phone:r.phone||"", email:r.email||"", linkedin:r.linkedin||"", notes:r.notes||"", createdAt:r.created_at }) : null;
+const fromContact = c => ({ id:c.id, name:c.name, company:c.company, role:c.role, segment:c.segment, phone:c.phone, email:c.email, linkedin:c.linkedin, notes:c.notes, created_at:c.createdAt||today() });
 
+const toOpp = r => r ? ({ id:r.id, title:r.title, company:r.company||"", contactId:r.contact_id||"", segment:r.segment||"Oil & Gas", stage:r.stage||"Lead", value:r.value||"", currency:r.currency||"USD", dueDate:r.due_date||"", notes:r.notes||"", createdAt:r.created_at }) : null;
+const fromOpp = o => ({ id:o.id, title:o.title, company:o.company, contact_id:o.contactId||null, segment:o.segment, stage:o.stage, value:o.value, currency:o.currency, due_date:o.dueDate||null, notes:o.notes, created_at:o.createdAt||today() });
+
+const toAct = r => r ? ({ id:r.id, type:r.type||"Call", title:r.title, contactId:r.contact_id||"", oppId:r.opp_id||"", date:r.date||"", status:r.status||"Pending", notes:r.notes||"", createdAt:r.created_at }) : null;
+const fromAct = a => ({ id:a.id, type:a.type, title:a.title, contact_id:a.contactId||null, opp_id:a.oppId||null, date:a.date, status:a.status, notes:a.notes, created_at:a.createdAt||today() });
+
+const toMkt = r => r ? ({ id:r.id, type:r.type||"LinkedIn Post", title:r.title, segment:r.segment||"Oil & Gas", date:r.date||"", status:r.status||"Planned", reach:r.reach||"", notes:r.notes||"", createdAt:r.created_at }) : null;
+const fromMkt = m => ({ id:m.id, type:m.type, title:m.title, segment:m.segment, date:m.date, status:m.status, reach:m.reach, notes:m.notes, created_at:m.createdAt||today() });
+
+// ── Styles ──────────────────────────────────────────────────────────────────
 const S = {
   col:   { display:"flex", flexDirection:"column", gap:12 },
   row:   { display:"flex", gap:12, alignItems:"flex-start" },
@@ -48,6 +55,7 @@ const S = {
   badge: (c,b) => ({ display:"inline-block", background:b||c+"22", color:c, borderRadius:20, padding:"2px 9px", fontSize:10, fontWeight:700, letterSpacing:"0.04em" }),
 };
 
+// ── UI Primitives ────────────────────────────────────────────────────────────
 function Inp({ label, ...p }) {
   return <div style={S.field}>{label&&<span style={S.label}>{label}</span>}<input style={S.input} {...p}/></div>;
 }
@@ -85,7 +93,11 @@ function Stat({ label, value, color, sub }) {
     {sub&&<div style={{fontSize:10,color:"#848D97",marginTop:1}}>{sub}</div>}
   </div>;
 }
+function SyncDot({ synced }) {
+  return <div title={synced?"Synced with Supabase":"Syncing..."} style={{width:7,height:7,borderRadius:"50%",background:synced?"#3FB950":"#F0A500",boxShadow:`0 0 6px ${synced?"#3FB950":"#F0A500"}`,transition:"background 0.4s"}}/>;
+}
 
+// ── Modals ───────────────────────────────────────────────────────────────────
 function ContactModal({ init={}, onSave, onClose }) {
   const [f,setF] = useState({name:"",company:"",role:"",segment:"Oil & Gas",phone:"",email:"",linkedin:"",notes:"",...init});
   const set = k => e => setF(p=>({...p,[k]:e.target.value}));
@@ -177,6 +189,7 @@ function MktModal({ init={}, onSave, onClose }) {
   </Modal>;
 }
 
+// ── Views ────────────────────────────────────────────────────────────────────
 function Dashboard({ contacts, opps, acts, mkt }) {
   const active  = opps.filter(o=>!["Won","Lost"].includes(o.stage));
   const pipeVal = active.reduce((a,o)=>a+(parseFloat(o.value)||0),0);
@@ -414,6 +427,7 @@ function Marketing({ mkt, onAdd, onEdit, onDel }) {
   </div>;
 }
 
+// ── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [tab,setTab]           = useState("dashboard");
   const [contacts,setContacts] = useState([]);
@@ -421,25 +435,96 @@ export default function App() {
   const [acts,setActs]         = useState([]);
   const [mkt,setMkt]           = useState([]);
   const [modal,setModal]       = useState(null);
+  const [synced,setSynced]     = useState(false);
+  const [loading,setLoading]   = useState(true);
+  const [error,setError]       = useState(null);
 
+  // ── Carga inicial desde Supabase ──────────────────────────────────────────
   useEffect(()=>{
-    setContacts(load("crm-contacts")||[]);
-    setOpps(load("crm-opps")||[]);
-    setActs(load("crm-acts")||[]);
-    setMkt(load("crm-mkt")||[]);
+    async function fetchAll() {
+      try {
+        const [c,o,a,m] = await Promise.all([
+          supabase.from("contacts").select("*").order("created_at",{ascending:false}),
+          supabase.from("opportunities").select("*").order("created_at",{ascending:false}),
+          supabase.from("activities").select("*").order("created_at",{ascending:false}),
+          supabase.from("marketing").select("*").order("created_at",{ascending:false}),
+        ]);
+        if(c.error||o.error||a.error||m.error) throw c.error||o.error||a.error||m.error;
+        setContacts((c.data||[]).map(toContact));
+        setOpps((o.data||[]).map(toOpp));
+        setActs((a.data||[]).map(toAct));
+        setMkt((m.data||[]).map(toMkt));
+        setSynced(true);
+      } catch(e) {
+        setError("No se pudo conectar con Supabase. Verifica tu URL y clave en supabaseClient.js");
+        console.error(e);
+      } finally {
+        setLoading(false);
+      }
+    }
+    fetchAll();
   },[]);
 
-  const upsert = (set,key) => item => {
-    set(prev=>{
-      const next=prev.find(x=>x.id===item.id)?prev.map(x=>x.id===item.id?item:x):[item,...prev];
-      save(key,next); return next;
+  // ── Realtime: escucha cambios de otros usuarios en tiempo real ────────────
+  useEffect(()=>{
+    const channel = supabase
+      .channel("crm-realtime")
+      .on("postgres_changes",{event:"*",schema:"public",table:"contacts"},     payload=>handleRT("contacts",    payload, setContacts, toContact))
+      .on("postgres_changes",{event:"*",schema:"public",table:"opportunities"},payload=>handleRT("opportunities",payload, setOpps,     toOpp))
+      .on("postgres_changes",{event:"*",schema:"public",table:"activities"},   payload=>handleRT("activities",  payload, setActs,     toAct))
+      .on("postgres_changes",{event:"*",schema:"public",table:"marketing"},    payload=>handleRT("marketing",   payload, setMkt,      toMkt))
+      .subscribe();
+    return () => supabase.removeChannel(channel);
+  },[]);
+
+  function handleRT(table, payload, setter, mapper) {
+    const { eventType, new: nw, old } = payload;
+    setter(prev => {
+      if(eventType==="INSERT") return [mapper(nw), ...prev.filter(x=>x.id!==nw.id)];
+      if(eventType==="UPDATE") return prev.map(x=>x.id===nw.id?mapper(nw):x);
+      if(eventType==="DELETE") return prev.filter(x=>x.id!==old.id);
+      return prev;
     });
+  }
+
+  // ── CRUD con Supabase ─────────────────────────────────────────────────────
+  const upsertContact = async item => {
+    const row = fromContact(item);
+    const { error } = item.id && contacts.find(x=>x.id===item.id)
+      ? await supabase.from("contacts").update(row).eq("id",row.id)
+      : await supabase.from("contacts").insert(row);
+    if(error) alert("Error guardando contacto: "+error.message);
     setModal(null);
   };
-  const remove = (set,key) => id => {
-    if(!window.confirm("Delete?")) return;
-    set(prev=>{ const next=prev.filter(x=>x.id!==id); save(key,next); return next; });
+  const upsertOpp = async item => {
+    const row = fromOpp(item);
+    const { error } = item.id && opps.find(x=>x.id===item.id)
+      ? await supabase.from("opportunities").update(row).eq("id",row.id)
+      : await supabase.from("opportunities").insert(row);
+    if(error) alert("Error guardando deal: "+error.message);
+    setModal(null);
   };
+  const upsertAct = async item => {
+    const row = fromAct(item);
+    const { error } = item.id && acts.find(x=>x.id===item.id)
+      ? await supabase.from("activities").update(row).eq("id",row.id)
+      : await supabase.from("activities").insert(row);
+    if(error) alert("Error guardando actividad: "+error.message);
+    setModal(null);
+  };
+  const upsertMkt = async item => {
+    const row = fromMkt(item);
+    const { error } = item.id && mkt.find(x=>x.id===item.id)
+      ? await supabase.from("marketing").update(row).eq("id",row.id)
+      : await supabase.from("marketing").insert(row);
+    if(error) alert("Error guardando campaña: "+error.message);
+    setModal(null);
+  };
+
+  const removeContact = async id => { if(!window.confirm("¿Eliminar contacto?"))return; await supabase.from("contacts").delete().eq("id",id); };
+  const removeOpp     = async id => { if(!window.confirm("¿Eliminar deal?"))return;     await supabase.from("opportunities").delete().eq("id",id); };
+  const removeAct     = async id => { if(!window.confirm("¿Eliminar actividad?"))return; await supabase.from("activities").delete().eq("id",id); };
+  const removeMkt     = async id => { if(!window.confirm("¿Eliminar campaña?"))return;  await supabase.from("marketing").delete().eq("id",id); };
 
   const nav=[
     {id:"dashboard",label:"Dashboard",icon:"◈"},
@@ -458,6 +543,8 @@ export default function App() {
         ::-webkit-scrollbar-thumb{background:#30363D;border-radius:99px}
         button:hover{opacity:.85}
       `}</style>
+
+      {/* Sidebar */}
       <div style={{width:190,background:T.sidebar,borderRight:"1px solid #30363D",display:"flex",flexDirection:"column",flexShrink:0}}>
         <div style={{padding:"18px 16px 12px",borderBottom:"1px solid #30363D33"}}>
           <div style={{fontSize:13,fontWeight:800,letterSpacing:"0.12em",color:T.amber}}>IXE CRM</div>
@@ -472,11 +559,18 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <div style={{padding:"10px 14px",borderTop:"1px solid #30363D",fontSize:9,color:"#484F58",lineHeight:1.6}}>
+        {/* Status de conexión */}
+        <div style={{padding:"10px 14px",borderTop:"1px solid #30363D",fontSize:9,color:"#484F58",lineHeight:1.8}}>
+          <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:3}}>
+            <SyncDot synced={synced}/>
+            <span style={{color:synced?T.green:T.amber}}>{synced?"Supabase ✓":"Conectando..."}</span>
+          </div>
           {contacts.length} contacts · {opps.length} deals<br/>
-          {acts.length} activities · localStorage
+          {acts.length} activities · Realtime ON
         </div>
       </div>
+
+      {/* Main content */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
         <div style={{padding:"14px 20px",borderBottom:"1px solid #30363D",background:T.sidebar,display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
           <div>
@@ -496,18 +590,40 @@ export default function App() {
             {tab==="mkt"      &&<button style={S.btn} onClick={()=>setModal({t:"mkt",d:{}})}>+ Campaign</button>}
           </div>
         </div>
+
         <div style={{flex:1,overflowY:"auto",padding:18}}>
-          {tab==="dashboard"&&<Dashboard contacts={contacts} opps={opps} acts={acts} mkt={mkt}/>}
-          {tab==="contacts" &&<Contacts contacts={contacts} onAdd={()=>setModal({t:"contact",d:{}})} onEdit={c=>setModal({t:"contact",d:c})} onDel={remove(setContacts,"crm-contacts")}/>}
-          {tab==="opps"     &&<Opps opps={opps} contacts={contacts} onAdd={()=>setModal({t:"opp",d:{}})} onEdit={o=>setModal({t:"opp",d:o})} onDel={remove(setOpps,"crm-opps")}/>}
-          {tab==="acts"     &&<Activities acts={acts} contacts={contacts} opps={opps} onAdd={()=>setModal({t:"act",d:{}})} onEdit={a=>setModal({t:"act",d:a})} onDel={remove(setActs,"crm-acts")}/>}
-          {tab==="mkt"      &&<Marketing mkt={mkt} onAdd={()=>setModal({t:"mkt",d:{}})} onEdit={m=>setModal({t:"mkt",d:m})} onDel={remove(setMkt,"crm-mkt")}/>}
+          {loading && (
+            <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"60%",gap:12}}>
+              <div style={{width:36,height:36,borderRadius:"50%",border:`3px solid ${T.amber}`,borderTopColor:"transparent",animation:"spin 0.8s linear infinite"}}/>
+              <div style={{color:T.muted,fontSize:13}}>Cargando datos desde Supabase...</div>
+              <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+            </div>
+          )}
+          {!loading && error && (
+            <div style={{...S.card,borderColor:T.red,background:"#3D0D0D22",padding:24,maxWidth:500,margin:"40px auto"}}>
+              <div style={{fontSize:22,marginBottom:8}}>⚠️</div>
+              <div style={{fontWeight:700,color:T.red,marginBottom:6}}>Error de conexión</div>
+              <div style={{fontSize:12,color:T.muted,lineHeight:1.6}}>{error}</div>
+              <div style={{fontSize:11,color:T.muted,marginTop:12,background:"#0D1117",borderRadius:6,padding:10,fontFamily:"monospace"}}>
+                Edita: <span style={{color:T.amber}}>src/supabaseClient.js</span><br/>
+                Reemplaza SUPABASE_URL y SUPABASE_ANON con tus credenciales.
+              </div>
+            </div>
+          )}
+          {!loading && !error && <>
+            {tab==="dashboard"&&<Dashboard contacts={contacts} opps={opps} acts={acts} mkt={mkt}/>}
+            {tab==="contacts" &&<Contacts contacts={contacts} onAdd={()=>setModal({t:"contact",d:{}})} onEdit={c=>setModal({t:"contact",d:c})} onDel={removeContact}/>}
+            {tab==="opps"     &&<Opps opps={opps} contacts={contacts} onAdd={()=>setModal({t:"opp",d:{}})} onEdit={o=>setModal({t:"opp",d:o})} onDel={removeOpp}/>}
+            {tab==="acts"     &&<Activities acts={acts} contacts={contacts} opps={opps} onAdd={()=>setModal({t:"act",d:{}})} onEdit={a=>setModal({t:"act",d:a})} onDel={removeAct}/>}
+            {tab==="mkt"      &&<Marketing mkt={mkt} onAdd={()=>setModal({t:"mkt",d:{}})} onEdit={m=>setModal({t:"mkt",d:m})} onDel={removeMkt}/>}
+          </>}
         </div>
       </div>
-      {modal?.t==="contact"&&<ContactModal init={modal.d} onSave={upsert(setContacts,"crm-contacts")} onClose={()=>setModal(null)}/>}
-      {modal?.t==="opp"    &&<OppModal     init={modal.d} contacts={contacts} onSave={upsert(setOpps,"crm-opps")} onClose={()=>setModal(null)}/>}
-      {modal?.t==="act"    &&<ActModal     init={modal.d} contacts={contacts} opps={opps} onSave={upsert(setActs,"crm-acts")} onClose={()=>setModal(null)}/>}
-      {modal?.t==="mkt"    &&<MktModal     init={modal.d} onSave={upsert(setMkt,"crm-mkt")} onClose={()=>setModal(null)}/>}
+
+      {modal?.t==="contact"&&<ContactModal init={modal.d} onSave={upsertContact} onClose={()=>setModal(null)}/>}
+      {modal?.t==="opp"    &&<OppModal     init={modal.d} contacts={contacts} onSave={upsertOpp} onClose={()=>setModal(null)}/>}
+      {modal?.t==="act"    &&<ActModal     init={modal.d} contacts={contacts} opps={opps} onSave={upsertAct} onClose={()=>setModal(null)}/>}
+      {modal?.t==="mkt"    &&<MktModal     init={modal.d} onSave={upsertMkt} onClose={()=>setModal(null)}/>}
     </div>
   );
 }
